@@ -1,0 +1,5 @@
+{
+  "name": "RetroWeb Multi-Emulator",
+  "description": "A simulated multi-emulator dashboard for GBA, NES, and GBC with Mali GPU support and multilingual interface.",
+  "requestFramePermissions": []
+}
