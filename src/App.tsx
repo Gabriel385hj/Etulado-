@@ -8,8 +8,11 @@ import {
 import * as jsnes from 'jsnes';
 import { WasmBoy } from 'wasmboy';
 // @ts-ignore
-import GameBoyAdvance from 'gbajs';
+import * as GameBoyAdvanceModule from 'gbajs';
 import { db } from './db';
+
+// Handle CommonJS export
+const GameBoyAdvance = GameBoyAdvanceModule.default || GameBoyAdvanceModule;
 
 type Tab = 'library' | 'graphics' | 'audio' | 'controls' | 'system';
 type Language = 'en' | 'pt-br' | 'es' | 'fr' | 'jp';
