@@ -184,11 +184,55 @@ export default function App() {
       },
       onAudioSample: (left: number, right: number) => {
         if (!audioEnabledRef.current) return;
-        if (!audioCtxRef.current) {
-          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
+        // Audio handling will be set up below, this callback just pushes to the buffer
+        // defined in the closure if we move the setup here.
+        // However, since we need the buffer variables, we should define them before.
       }
     });
+
+    // Audio Setup
+    let audioBuffer: Float32Array;
+    let writeIndex = 0;
+    let readIndex = 0;
+    const BUFFER_SIZE = 8192;
+    
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (AudioContext) {
+      const audioCtx = new AudioContext();
+      audioCtxRef.current = audioCtx;
+      const scriptNode = audioCtx.createScriptProcessor(1024, 0, 2);
+      audioBuffer = new Float32Array(BUFFER_SIZE);
+      
+      scriptNode.onaudioprocess = (e) => {
+        const outputLeft = e.outputBuffer.getChannelData(0);
+        const outputRight = e.outputBuffer.getChannelData(1);
+        
+        for (let i = 0; i < 1024; i++) {
+          if (readIndex !== writeIndex) {
+            const val = audioBuffer[readIndex];
+            outputLeft[i] = val;
+            outputRight[i] = val;
+            readIndex = (readIndex + 1) % BUFFER_SIZE;
+          } else {
+            outputLeft[i] = 0;
+            outputRight[i] = 0;
+          }
+        }
+      };
+      
+      scriptNode.connect(audioCtx.destination);
+      
+      // Override the onAudioSample to actually push data
+      nes.opts.onAudioSample = (left: number, right: number) => {
+        if (!audioEnabledRef.current) return;
+        audioBuffer[writeIndex] = left; // Using left channel for mono, or mix: (left + right) * 0.5
+        writeIndex = (writeIndex + 1) % BUFFER_SIZE;
+        // If we hit the read pointer, bump it (overwrite old data)
+        if (writeIndex === readIndex) {
+            readIndex = (readIndex + 1) % BUFFER_SIZE;
+        }
+      };
+    }
 
     // Use a more robust binary string conversion
     // We use a loop to avoid stack overflow on large ROMs and encoding issues
@@ -230,6 +274,11 @@ export default function App() {
     try {
       await WasmBoy.setCanvas(canvasRef.current);
       await WasmBoy.loadROM(gameData);
+      if (audioEnabledRef.current) {
+        await WasmBoy.enableAudio();
+      } else {
+        await WasmBoy.disableAudio();
+      }
       await WasmBoy.play();
     } catch (err) {
       console.error("WasmBoy error:", err);
@@ -250,6 +299,10 @@ export default function App() {
       nesRef.current = null; 
       if (playingGame?.type === 'GBC') {
         WasmBoy.pause();
+      }
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close();
+        audioCtxRef.current = null;
       }
     };
   }, [playingGame, isBooting, startNes, startGbc]);
