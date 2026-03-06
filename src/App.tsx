@@ -2,13 +2,19 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
   Gamepad2, Monitor, Volume2, Settings, Library, Plus, Play, X, Cpu,
   Smartphone, HardDrive, Menu, Languages, Layers, Keyboard,
-  ChevronUp, ChevronDown, ChevronLeft, ChevronRight
+  ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Trash2,
+  Maximize, Minimize, RotateCcw, ArrowLeft
 } from 'lucide-react';
 import * as jsnes from 'jsnes';
 import { WasmBoy } from 'wasmboy';
+// @ts-ignore
+import GameBoyAdvance from 'gbajs';
+import { db } from './db';
 
 type Tab = 'library' | 'graphics' | 'audio' | 'controls' | 'system';
 type Language = 'en' | 'pt-br' | 'es' | 'fr' | 'jp';
+type ScreenSize = '1x' | '2x' | 'fit' | 'stretch';
+type Orientation = 'landscape' | 'portrait';
 
 interface Game {
   id: string;
@@ -16,7 +22,7 @@ interface Game {
   size: string;
   dateAdded: string;
   type: 'GBA' | 'NES' | 'GBC';
-  data?: Uint8Array;
+  data: Uint8Array;
 }
 
 const translations = {
@@ -114,9 +120,13 @@ export default function App() {
   const [mappingKey, setMappingKey] = useState<keyof typeof DEFAULT_KEYS | null>(null);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [showOnScreenControls, setShowOnScreenControls] = useState(true);
+  const [screenSize, setScreenSize] = useState<ScreenSize>('fit');
+  const [orientation, setOrientation] = useState<Orientation>('landscape');
+  const [showInGameMenu, setShowInGameMenu] = useState(false);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nesRef = useRef<any>(null);
+  const gbaRef = useRef<any>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const t = translations[lang] || translations.en;
@@ -127,10 +137,27 @@ export default function App() {
     label: t[item.id as keyof typeof t] || item.label
   }));
 
+  useEffect(() => {
+    db.getAllGames().then(setGames);
+  }, []);
+
   const handlePlay = (game: Game) => {
     setPlayingGame(game);
     setIsBooting(true);
     setTimeout(() => setIsBooting(false), 1500);
+  };
+
+  const handleBackToLibrary = () => {
+    setPlayingGame(null);
+    setShowInGameMenu(false);
+  };
+
+  const handleDelete = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (confirm('Delete this game?')) {
+      await db.deleteGame(id);
+      setGames(games.filter(g => g.id !== id));
+    }
   };
 
   const handleInstallROM = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -150,6 +177,7 @@ export default function App() {
         type,
         data: new Uint8Array(buffer)
       };
+      await db.addGame(newGame);
       setGames([...games, newGame]);
     }
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -287,16 +315,58 @@ export default function App() {
     }
   }, []);
 
+  const startGba = useCallback((gameData: Uint8Array) => {
+    if (!canvasRef.current) return;
+    try {
+      const gba = new GameBoyAdvance();
+      gba.setCanvas(canvasRef.current);
+      gba.setBios(null); // gbajs might need a BIOS, but we try without or rely on HLE if available
+      gba.loadRom(gameData);
+      gba.runStable();
+      gbaRef.current = gba;
+      
+      // Fix audio stuttering: ensure context is running
+      if (gba.audio && gba.audio.context) {
+        if (gba.audio.context.state === 'suspended') {
+          gba.audio.context.resume();
+        }
+        // If audio is disabled in settings, mute it
+        if (!audioEnabledRef.current) {
+           gba.audio.context.suspend();
+        }
+      }
+    } catch (err) {
+      console.error("GBA Load Error:", err);
+      alert("Failed to load GBA ROM. It might require a BIOS file or be corrupted.");
+      setPlayingGame(null);
+    }
+  }, []);
+
   useEffect(() => {
     if (!isBooting && playingGame?.data) {
       if (playingGame.type === 'NES') {
         startNes(playingGame.data);
       } else if (playingGame.type === 'GBC') {
         startGbc(playingGame.data);
+      } else if (playingGame.type === 'GBA') {
+        startGba(playingGame.data);
       }
     }
     return () => { 
       nesRef.current = null; 
+      if (gbaRef.current) {
+        // gbajs doesn't have a clear 'stop' method that kills everything cleanly in one go,
+        // but we can pause it.
+        // Actually, looking at source, there isn't a simple stop.
+        // We can try to pause.
+        // gbaRef.current.pause(); 
+        // But for now just nulling it and letting GC handle it might be okay if we stop the loop.
+        // gbajs uses requestAnimationFrame internally.
+        // We should check if there is a way to stop it.
+        // gba.pause() exists.
+        if (gbaRef.current.pause) gbaRef.current.pause();
+        gbaRef.current = null;
+      }
       if (playingGame?.type === 'GBC') {
         WasmBoy.pause();
       }
@@ -305,7 +375,7 @@ export default function App() {
         audioCtxRef.current = null;
       }
     };
-  }, [playingGame, isBooting, startNes, startGbc]);
+  }, [playingGame, isBooting, startNes, startGbc, startGba]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent | { key: string }) => {
     if (mappingKey && 'key' in e) {
@@ -340,6 +410,24 @@ export default function App() {
           [jsnes.Controller.BUTTON_START]: 'START',
         };
         WasmBoy.setJoypadState({ [wasmBtnMap[mappedBtn]]: true });
+      } else if (playingGame?.type === 'GBA' && gbaRef.current) {
+        // gbajs uses key codes, but we can map them.
+        // Actually, gbajs has a keypad object.
+        // gba.keypad.press(key)
+        // Keys: A=0, B=1, SELECT=2, START=3, RIGHT=4, LEFT=5, UP=6, DOWN=7, R=8, L=9
+        const gbaBtnMap: any = {
+          [jsnes.Controller.BUTTON_A]: 0,
+          [jsnes.Controller.BUTTON_B]: 1,
+          [jsnes.Controller.BUTTON_SELECT]: 2,
+          [jsnes.Controller.BUTTON_START]: 3,
+          [jsnes.Controller.BUTTON_RIGHT]: 4,
+          [jsnes.Controller.BUTTON_LEFT]: 5,
+          [jsnes.Controller.BUTTON_UP]: 6,
+          [jsnes.Controller.BUTTON_DOWN]: 7,
+        };
+        if (gbaBtnMap[mappedBtn] !== undefined) {
+          gbaRef.current.keypad.press(gbaBtnMap[mappedBtn]);
+        }
       }
     }
   }, [kbConfig, mappingKey, playingGame]);
@@ -371,6 +459,20 @@ export default function App() {
           [jsnes.Controller.BUTTON_START]: 'START',
         };
         WasmBoy.setJoypadState({ [wasmBtnMap[mappedBtn]]: false });
+      } else if (playingGame?.type === 'GBA' && gbaRef.current) {
+        const gbaBtnMap: any = {
+          [jsnes.Controller.BUTTON_A]: 0,
+          [jsnes.Controller.BUTTON_B]: 1,
+          [jsnes.Controller.BUTTON_SELECT]: 2,
+          [jsnes.Controller.BUTTON_START]: 3,
+          [jsnes.Controller.BUTTON_RIGHT]: 4,
+          [jsnes.Controller.BUTTON_LEFT]: 5,
+          [jsnes.Controller.BUTTON_UP]: 6,
+          [jsnes.Controller.BUTTON_DOWN]: 7,
+        };
+        if (gbaBtnMap[mappedBtn] !== undefined) {
+          gbaRef.current.keypad.release(gbaBtnMap[mappedBtn]);
+        }
       }
     }
   }, [kbConfig, playingGame]);
@@ -437,6 +539,13 @@ export default function App() {
                   <div key={game.id} className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden group">
                     <div className="h-40 bg-zinc-950 flex items-center justify-center relative">
                       <div className="absolute top-2 right-2 bg-indigo-500 text-[10px] font-bold px-2 py-0.5 rounded">{game.type}</div>
+                      <button 
+                        onClick={(e) => handleDelete(e, game.id)}
+                        className="absolute top-2 left-2 p-1.5 bg-red-500/20 hover:bg-red-500 text-red-500 hover:text-white rounded-md transition-colors opacity-0 group-hover:opacity-100 z-10"
+                        title="Delete Game"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                       <Gamepad2 className="w-16 h-16 text-zinc-800 group-hover:scale-110 transition-transform" />
                       <div className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                         <button onClick={() => handlePlay(game)} className="w-14 h-14 bg-indigo-500 rounded-full flex items-center justify-center"><Play className="ml-1" /></button>
@@ -541,21 +650,93 @@ export default function App() {
 
       {/* Game Player Overlay */}
       {playingGame && (
-        <div className="fixed inset-0 z-50 bg-black flex flex-col select-none">
-          <div className="p-4 flex justify-between items-center bg-black/80">
+        <div className={`fixed inset-0 z-50 bg-black flex flex-col select-none ${orientation === 'portrait' ? 'flex-col' : 'flex-col'}`}>
+          <div className="p-4 flex justify-between items-center bg-black/80 z-20">
             <div className="text-xs opacity-50 flex gap-4"><span>RetroWeb Core</span></div>
-            <button onClick={() => setPlayingGame(null)} className="p-2 bg-zinc-900 hover:bg-red-500 rounded-full"><X className="w-6 h-6" /></button>
+            <div className="flex items-center gap-4">
+               <button onClick={() => setShowInGameMenu(!showInGameMenu)} className="p-2 bg-zinc-900 hover:bg-indigo-500 rounded-full transition-colors">
+                 <Settings className="w-6 h-6" />
+               </button>
+               <button onClick={() => setPlayingGame(null)} className="p-2 bg-zinc-900 hover:bg-red-500 rounded-full transition-colors"><X className="w-6 h-6" /></button>
+            </div>
           </div>
-          <div className="flex-1 flex items-center justify-center bg-zinc-950 relative overflow-hidden">
+          
+          {/* In-Game Menu */}
+          {showInGameMenu && (
+            <div className="absolute inset-0 z-30 bg-black/90 flex items-center justify-center">
+              <div className="bg-zinc-900 p-6 rounded-2xl border border-zinc-800 w-80 max-w-full space-y-4">
+                <h3 className="text-xl font-bold mb-4 flex items-center gap-2"><Settings className="text-indigo-500" /> Game Settings</h3>
+                
+                <button onClick={handleBackToLibrary} className="w-full bg-indigo-600 hover:bg-indigo-500 p-3 rounded-lg flex items-center justify-center gap-2 font-medium transition-colors">
+                  <ArrowLeft className="w-5 h-5" /> Back to Library
+                </button>
+                
+                <div className="pt-4 border-t border-zinc-800">
+                  <label className="text-sm text-zinc-400 mb-2 block">Screen Size</label>
+                  <div className="grid grid-cols-4 gap-2">
+                    {(['1x', '2x', 'fit', 'stretch'] as ScreenSize[]).map(size => (
+                      <button 
+                        key={size} 
+                        onClick={() => setScreenSize(size)}
+                        className={`p-2 rounded text-xs font-medium border ${screenSize === size ? 'bg-indigo-500/20 border-indigo-500 text-indigo-400' : 'bg-zinc-950 border-zinc-800 text-zinc-400'}`}
+                      >
+                        {size.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="pt-2">
+                  <label className="text-sm text-zinc-400 mb-2 block">Orientation</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button 
+                      onClick={() => setOrientation('landscape')}
+                      className={`p-2 rounded text-xs font-medium border flex items-center justify-center gap-2 ${orientation === 'landscape' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-400' : 'bg-zinc-950 border-zinc-800 text-zinc-400'}`}
+                    >
+                      <Maximize className="w-4 h-4 rotate-90" /> Landscape
+                    </button>
+                    <button 
+                      onClick={() => setOrientation('portrait')}
+                      className={`p-2 rounded text-xs font-medium border flex items-center justify-center gap-2 ${orientation === 'portrait' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-400' : 'bg-zinc-950 border-zinc-800 text-zinc-400'}`}
+                    >
+                      <Minimize className="w-4 h-4" /> Portrait
+                    </button>
+                  </div>
+                </div>
+
+                <button onClick={() => setShowInGameMenu(false)} className="w-full bg-zinc-800 hover:bg-zinc-700 p-3 rounded-lg mt-4 transition-colors">
+                  Resume Game
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className={`flex-1 flex items-center justify-center bg-zinc-950 relative overflow-hidden ${orientation === 'portrait' ? 'flex-col' : ''}`}>
             {isBooting ? (
               <div className="text-center">
                 <div className="w-16 h-16 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
                 <h2 className="text-xl font-bold">{t.booting} {playingGame.name}...</h2>
               </div>
             ) : (
-              <div className="w-full h-full flex flex-col items-center justify-center relative">
-                {playingGame.type === 'NES' || playingGame.type === 'GBC' ? (
-                  <canvas ref={canvasRef} width={playingGame.type === 'NES' ? NES_SCREEN_WIDTH : 160} height={playingGame.type === 'NES' ? NES_SCREEN_HEIGHT : 144} className="max-w-full max-h-[80vh] image-render-pixel shadow-2xl border-4 border-zinc-800" style={{ imageRendering: 'pixelated' }} />
+              <div className={`w-full h-full flex flex-col items-center justify-center relative ${orientation === 'portrait' ? 'justify-start pt-10' : ''}`}>
+                {playingGame.type === 'NES' || playingGame.type === 'GBC' || playingGame.type === 'GBA' ? (
+                  <canvas 
+                    ref={canvasRef} 
+                    width={playingGame.type === 'NES' ? NES_SCREEN_WIDTH : (playingGame.type === 'GBA' ? 240 : 160)} 
+                    height={playingGame.type === 'NES' ? NES_SCREEN_HEIGHT : (playingGame.type === 'GBA' ? 160 : 144)} 
+                    className={`image-render-pixel shadow-2xl border-4 border-zinc-800 transition-all duration-300 ${
+                      screenSize === '1x' ? '' : 
+                      screenSize === '2x' ? 'scale-[2]' : 
+                      screenSize === 'fit' ? 'max-w-full max-h-full object-contain' : 
+                      'w-full h-full object-fill'
+                    }`}
+                    style={{ 
+                      imageRendering: 'pixelated',
+                      width: screenSize === '1x' ? undefined : (screenSize === '2x' ? undefined : (screenSize === 'stretch' ? '100%' : undefined)),
+                      height: screenSize === '1x' ? undefined : (screenSize === '2x' ? undefined : (screenSize === 'stretch' ? '100%' : undefined)),
+                      transform: screenSize === '2x' ? 'scale(2)' : 'none'
+                    }} 
+                  />
                 ) : (
                   <div className="text-center max-w-md p-8 bg-zinc-900 rounded-2xl border border-zinc-800">
                     <Gamepad2 className="w-20 h-20 text-indigo-500 mx-auto mb-6" />
@@ -566,7 +747,7 @@ export default function App() {
                 
                 {/* On-Screen Controls */}
                 {showOnScreenControls && (
-                  <div className="absolute inset-0 pointer-events-none">
+                  <div className={`absolute inset-0 pointer-events-none ${orientation === 'portrait' ? 'top-auto h-1/2 bg-zinc-900/50 border-t border-white/10' : ''}`}>
                     {/* D-PAD */}
                     <div className="absolute bottom-12 left-8 w-32 h-32 pointer-events-auto flex items-center justify-center">
                       <div className="grid grid-cols-3 grid-rows-3 gap-1">
